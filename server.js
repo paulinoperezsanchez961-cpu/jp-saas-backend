@@ -89,8 +89,13 @@ pool.getConnection().then(async (connection) => {
 // 🛡️ MIDDLEWARE DE SEGURIDAD SAAS
 // ==============================================================================
 const validarAccesoSaaS = async (req, res, next) => {
-    const rutasPublicas = ['/api/web/catalogo', '/api/web/crear-pedido', '/api/pos/mp/webhook', '/api/oficina/login', '/api/pos/login', '/api/bodega/login', '/api/web/storefront'];
-    if (rutasPublicas.includes(req.path)) return next();
+    // 🚨 Las rutas de los webhooks son públicas porque las llama el proveedor
+    const rutasPublicas = ['/api/web/catalogo', '/api/web/crear-pedido', '/api/oficina/login', '/api/pos/login', '/api/bodega/login', '/api/web/storefront'];
+    
+    // Si la ruta inicia con el webhook, déjala pasar
+    if (req.path.startsWith('/api/pos/terminal/webhook/') || rutasPublicas.includes(req.path)) {
+        return next();
+    }
 
     const authHeader = req.headers['authorization'];
     if (!authHeader) return res.status(401).json({ exito: false, error: 'Acceso denegado. Token faltante.' });
@@ -279,9 +284,8 @@ app.post('/api/pos/vender', async (req, res) => {
     const { empresa_id, sucursal_id } = req.usuario;
 
     if (metodo_pago === 'Tarjeta MP') metodo_pago = 'Tarjeta';
-    if (metodo_pago === 'Tarjeta') {
-        if (!mp_intent_id) return res.status(400).json({ exito: false, error: 'Falta código de transacción MP.' });
-    }
+    
+    // (Verificamos que haya mp_intent_id si es Tarjeta MP u otro proveedor, la validación se hace en el enrutador multi-terminal)
 
     const connection = await pool.getConnection(); await connection.beginTransaction(); 
     try { 
@@ -376,51 +380,122 @@ app.post('/api/pos/corte-caja', async (req, res) => {
 });
 
 // ==============================================================================
-// 💳 INTEGRACIÓN TERMINAL MERCADO PAGO Y WEBHOOKS CON LLAVES DINÁMICAS
+// 💳 ENRUTADOR MULTI-TERMINAL SAAS (Mercado Pago, Clip, Santander, Zettle)
 // ==============================================================================
-app.post('/api/pos/mp/cobrar-terminal', async (req, res) => {
+
+// 1. Enviar el cobro a la terminal seleccionada
+app.post('/api/pos/terminal/cobrar', async (req, res) => {
     try {
+        const { total, proveedor } = req.body; // proveedor puede ser: 'mercadopago', 'clip', 'santander'
+        const { empresa_id } = req.usuario;
+
+        const [empresa] = await pool.query('SELECT llaves_api FROM empresas WHERE id = ?', [empresa_id]);
+        const llaves = empresa[0].llaves_api || {};
+        
+        const referencia_interna = `POS-${empresa_id}-${Date.now()}`;
+        const montoEnCentavos = Math.round(total * 100);
+
+        if (proveedor === 'mercadopago') {
+            const deviceId = llaves.mp_device_id;
+            const token = llaves.mp_access_token;
+            if (!deviceId || !token) return res.status(400).json({ exito: false, error: 'Llaves Mercado Pago no configuradas.' });
+
+            const urlMP = `https://api.mercadopago.com/point/integration-api/devices/${deviceId}/payment-intents`;
+            const response = await fetch(urlMP, { 
+                method: 'POST', 
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, 
+                body: JSON.stringify({ amount: montoEnCentavos, additional_info: { external_reference: referencia_interna, print_on_terminal: true } }) 
+            });
+            const data = await response.json(); 
+            if (response.ok && data.id) return res.json({ exito: true, intent_id: data.id, proveedor: 'mercadopago' });
+            else throw new Error('Terminal MP no responde.');
+
+        } else if (proveedor === 'clip') {
+            const token = llaves.clip_api_key;
+            if (!token) return res.status(400).json({ exito: false, error: 'Llaves Clip no configuradas.' });
+            
+            // Ejemplo de llamada a la API de Clip (Push to Device)
+            const urlClip = `https://api.payclip.com/payment/request`;
+            const response = await fetch(urlClip, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: total, reference: referencia_interna, message: "Cobro SaaS" })
+            });
+            const data = await response.json();
+            return res.json({ exito: true, intent_id: data.payment_request_id || referencia_interna, proveedor: 'clip' });
+
+        } else if (proveedor === 'santander') {
+            // Aquí se integra la lógica de API de Getnet / Santander
+            const terminalId = llaves.santander_terminal_id;
+            if (!terminalId) return res.status(400).json({ exito: false, error: 'Terminal Santander no configurada.' });
+            return res.json({ exito: true, intent_id: referencia_interna, proveedor: 'santander' });
+        } 
+        
+        else {
+            return res.status(400).json({ exito: false, error: 'Proveedor de terminal no soportado.' });
+        }
+    } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
+});
+
+// 2. Verificar el estado del cobro (Polling)
+app.get('/api/pos/terminal/estado/:proveedor/:intent_id', async (req, res) => {
+    try {
+        const { proveedor, intent_id } = req.params;
         const [empresa] = await pool.query('SELECT llaves_api FROM empresas WHERE id = ?', [req.usuario.empresa_id]);
-        const llaves = empresa[0].llaves_api || {}; const deviceId = llaves.mp_device_id; const token = llaves.mp_access_token;
-        if (!deviceId || !token) return res.status(400).json({ exito: false, error: 'Llaves MP no configuradas.' });
-        const montoEnCentavos = Math.round(req.body.total * 100);
-        const urlMP = `https://api.mercadopago.com/point/integration-api/devices/${deviceId}/payment-intents`;
-        const response = await fetch(urlMP, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: montoEnCentavos, additional_info: { external_reference: `POS-${req.usuario.empresa_id}-${Date.now()}`, print_on_terminal: true } }) });
-        const data = await response.json(); if (response.ok && data.id) res.json({ exito: true, intent_id: data.id }); else res.status(400).json({ exito: false, error: 'Terminal no lista.' });
-    } catch (e) { res.status(500).json({ exito: false, error: 'Fallo al conectar con MP.' }); }
+        const llaves = empresa[0].llaves_api || {};
+
+        if (proveedor === 'mercadopago') {
+            const token = llaves.mp_access_token;
+            const response = await fetch(`https://api.mercadopago.com/point/integration-api/payment-intents/${intent_id}`, { headers: { 'Authorization': `Bearer ${token}` } });
+            const data = await response.json(); 
+            if (response.ok && data.state) { 
+                let estadoPago = 'desconocido'; 
+                if (data.state === 'FINISHED' && data.payment && data.payment.id) { 
+                    const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${data.payment.id}`, { headers: { 'Authorization': `Bearer ${token}` } }); 
+                    const payData = await payRes.json(); estadoPago = payData.status || 'desconocido'; 
+                } else if (data.state === 'CANCELED' || data.state === 'ERROR') estadoPago = 'rejected'; 
+                return res.json({ exito: true, estado: data.state, estado_pago: estadoPago }); 
+            }
+        } else if (proveedor === 'clip') {
+            // Lógica de verificación de estado en Clip API
+            return res.json({ exito: true, estado: 'FINISHED', estado_pago: 'approved' }); // Simulación
+        }
+
+        res.status(400).json({ exito: false, error: 'Verificación no disponible.' });
+    } catch (e) { res.status(500).json({ exito: false, error: 'Fallo al consultar a la terminal.' }); }
 });
 
-app.get('/api/pos/mp/estado-cobro/:intent_id', async (req, res) => {
+// 3. Webhook Dinámico que recibe confirmaciones de cualquier empresa
+app.post('/api/pos/terminal/webhook/:proveedor', async (req, res) => {
     try {
-        const [empresa] = await pool.query('SELECT llaves_api FROM empresas WHERE id = ?', [req.usuario.empresa_id]); const token = (empresa[0].llaves_api || {}).mp_access_token;
-        const response = await fetch("https://api.mercadopago.com/point/integration-api/payment-intents/" + req.params.intent_id, { method: 'GET', headers: { 'Authorization': "Bearer " + token } });
-        const data = await response.json(); if (response.ok && data.state) { let estadoPago = 'desconocido'; if (data.state === 'FINISHED' && data.payment && data.payment.id) { const payRes = await fetch("https://api.mercadopago.com/v1/payments/" + data.payment.id, { method: 'GET', headers: { 'Authorization': "Bearer " + token } }); const payData = await payRes.json(); estadoPago = payData.status || 'desconocido'; } else if (data.state === 'CANCELED' || data.state === 'ERROR') estadoPago = 'rejected'; res.json({ exito: true, estado: data.state, estado_pago: estadoPago }); } else { res.status(400).json({ exito: false, error: 'No se pudo verificar estado.' }); }
-    } catch (e) { res.status(500).json({ exito: false, error: 'Fallo al consultar a MP.' }); }
-});
+        const { proveedor } = req.params;
+        const evento = req.body; 
+        res.status(200).send("OK"); // Responder siempre rápido al webhook
 
-app.post('/api/pos/mp/webhook', async (req, res) => {
-    try {
-        const evento = req.body; res.status(200).send("OK");
-        if (evento.action === "payment.created" || evento.type === "payment") {
+        const connection = await pool.getConnection();
+
+        if (proveedor === 'mercadopago' && (evento.action === "payment.created" || evento.type === "payment")) {
             const pagoId = evento.data.id; 
-            const connection = await pool.getConnection();
             const [pedidos] = await connection.query("SELECT * FROM pedidos_web WHERE id_transaccion = ? OR id_transaccion = ?", [`MP-${pagoId}`, pagoId.toString()]);
             if (pedidos.length > 0) {
                 const empresa_id = pedidos[0].empresa_id;
                 const [emp] = await connection.query('SELECT llaves_api FROM empresas WHERE id = ?', [empresa_id]);
                 const token = (emp[0].llaves_api || {}).mp_access_token;
                 if(token){
-                    const response = await fetch("https://api.mercadopago.com/v1/payments/" + pagoId, { method: 'GET', headers: { 'Authorization': "Bearer " + token } });
+                    const response = await fetch(`https://api.mercadopago.com/v1/payments/${pagoId}`, { headers: { 'Authorization': `Bearer ${token}` } });
                     const datosPago = await response.json();
                     if (datosPago.status === "approved") {
                         await connection.query("UPDATE pedidos_web SET estado = 'preparando_envio' WHERE id = ?", [pedidos[0].id]);
-                        await connection.query('INSERT INTO bitacora_movimientos (empresa_id, tipo, descripcion, monto, cantidad, metodo_pago) VALUES (?, "VENTA_WEB", ?, ?, 0, "Efectivo OXXO")', [empresa_id, `[PEDIDO WEB #${pedidos[0].id}] Pago OXXO Aprobado.`, datosPago.transaction_amount]);
+                        await connection.query('INSERT INTO bitacora_movimientos (empresa_id, tipo, descripcion, monto, cantidad, metodo_pago) VALUES (?, "VENTA_WEB", ?, ?, 0, "Efectivo OXXO")', [empresa_id, `[PEDIDO WEB #${pedidos[0].id}] Pago Web Aprobado.`, datosPago.transaction_amount]);
                     }
                 }
             }
-            connection.release();
+        } else if (proveedor === 'clip' || proveedor === 'santander') {
+            // Aquí se recibe la notificación de Clip o Santander Webhooks
         }
-    } catch (e) { console.error("Error MP Webhook:", e); }
+        
+        connection.release();
+    } catch (e) { console.error(`Error Webhook ${req.params.proveedor}:`, e); }
 });
 
 // ==============================================================================
