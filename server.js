@@ -33,11 +33,8 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
-// 🚨 RESEND ES GLOBAL (Se paga con la suscripción del SaaS)
 const resend = new Resend(process.env.RESEND_API_KEY);
 const SECRET_KEY = process.env.JWT_SECRET || 'super_secreta_saas_2026';
-
-// 🌐 DOMINIO PRINCIPAL SAAS
 const DOMINIO_SAAS = process.env.PUBLIC_URL || 'https://ppservice.icu';
 
 function prepImg(filePath, mimeType) {
@@ -59,28 +56,39 @@ pool.on('connection', (connection) => {
 pool.getConnection().then(async (connection) => {
     console.log(`🧠 Cerebro SaaS FINAL en línea | Dominio base: ${DOMINIO_SAAS}`);
     
-    await connection.query(`CREATE TABLE IF NOT EXISTS empresas (id INT AUTO_INCREMENT PRIMARY KEY, nombre_comercial VARCHAR(255), plan VARCHAR(50) DEFAULT 'basico', estado VARCHAR(50) DEFAULT 'activo', llaves_api JSON, fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).catch(() => {});
-    await connection.query(`CREATE TABLE IF NOT EXISTS sucursales (id INT AUTO_INCREMENT PRIMARY KEY, empresa_id INT, nombre VARCHAR(255), direccion TEXT, FOREIGN KEY (empresa_id) REFERENCES empresas(id))`).catch(() => {});
-
+    await connection.query(`CREATE TABLE IF NOT EXISTS empresas (id INT AUTO_INCREMENT PRIMARY KEY, codigo_empresa VARCHAR(50) UNIQUE, nombre_comercial VARCHAR(255), plan VARCHAR(50) DEFAULT 'basico', estado VARCHAR(50) DEFAULT 'activo', codigo_licencia VARCHAR(50) UNIQUE, limite_sucursales INT DEFAULT 1, llaves_api JSON, fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).catch(() => {});
+    await connection.query(`CREATE TABLE IF NOT EXISTS sucursales (id INT AUTO_INCREMENT PRIMARY KEY, empresa_id INT, nombre VARCHAR(255), direccion TEXT, fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (empresa_id) REFERENCES empresas(id) ON DELETE CASCADE)`).catch(() => {});
     await connection.query(`CREATE TABLE IF NOT EXISTS apartados (id INT AUTO_INCREMENT PRIMARY KEY, empresa_id INT, sucursal_id INT, cliente VARCHAR(255), descripcion_prendas TEXT, total DECIMAL(10,2), enganche DECIMAL(10,2), resta DECIMAL(10,2), items JSON, estado VARCHAR(50) DEFAULT 'activo', fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).catch(() => {});
     await connection.query(`CREATE TABLE IF NOT EXISTS gastos_fijos (id INT AUTO_INCREMENT PRIMARY KEY, empresa_id INT, sucursal_id INT, concepto VARCHAR(255), monto DECIMAL(10,2), fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).catch(() => {});
     await connection.query(`CREATE TABLE IF NOT EXISTS pedidos_web (id INT AUTO_INCREMENT PRIMARY KEY, empresa_id INT, cliente VARCHAR(255), info_envio TEXT, total DECIMAL(10,2), estado VARCHAR(50), guia_rastreo VARCHAR(255), paqueteria VARCHAR(100), metodo_pago VARCHAR(50), id_transaccion VARCHAR(255), fecha_compra TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).catch(() => {});
-    await connection.query(`CREATE TABLE IF NOT EXISTS configuracion_tienda (parametro VARCHAR(255), empresa_id INT, valor VARCHAR(255), PRIMARY KEY (parametro, empresa_id))`).catch(() => {});
+    await connection.query(`CREATE TABLE IF NOT EXISTS configuracion_tienda (parametro VARCHAR(255), empresa_id INT, valor VARCHAR(255), PRIMARY KEY (parametro, empresa_id))` ).catch(() => {});
 
     const tablasMultiTenant = ['productos', 'historial_cortes', 'staff', 'bitacora_movimientos', 'clientes', 'historial_cashback', 'cortes', 'chips_nfc'];
-    for (const tabla of tablasMultiTenant) { await connection.query(`ALTER TABLE ${tabla} ADD COLUMN empresa_id INT`).catch(() => {}); }
+    for (const tabla of tablasMultiTenant) { await connection.query(`ALTER TABLE ${tabla} ADD COLUMN IF NOT EXISTS empresa_id INT`).catch(() => {}); }
     const tablasConSucursal = ['historial_cortes', 'bitacora_movimientos', 'staff', 'apartados', 'gastos_fijos'];
-    for (const tabla of tablasConSucursal) { await connection.query(`ALTER TABLE ${tabla} ADD COLUMN sucursal_id INT`).catch(() => {}); }
+    for (const tabla of tablasConSucursal) { await connection.query(`ALTER TABLE ${tabla} ADD COLUMN IF NOT EXISTS sucursal_id INT`).catch(() => {}); }
 
-    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN detalles JSON`).catch(() => {});
-    await connection.query(`ALTER TABLE staff ADD COLUMN descuento_cliente DECIMAL(10,2) DEFAULT 0`).catch(() => {});
-    await connection.query(`ALTER TABLE bitacora_movimientos ADD COLUMN metodo_pago VARCHAR(255) DEFAULT 'Efectivo'`).catch(() => {});
+    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN IF NOT EXISTS detalles JSON`).catch(() => {});
+    await connection.query(`ALTER TABLE staff ADD COLUMN IF NOT EXISTS descuento_cliente DECIMAL(10,2) DEFAULT 0`).catch(() => {});
+    await connection.query(`ALTER TABLE bitacora_movimientos ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(255) DEFAULT 'Efectivo'`).catch(() => {});
     await connection.query(`ALTER TABLE bitacora_movimientos MODIFY COLUMN metodo_pago VARCHAR(255) DEFAULT 'Efectivo'`).catch(() => {});
-    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN ventas_efectivo DECIMAL(10,2) DEFAULT 0`).catch(() => {});
-    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN ventas_tarjeta DECIMAL(10,2) DEFAULT 0`).catch(() => {});
-    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN ventas_transferencia DECIMAL(10,2) DEFAULT 0`).catch(() => {});
+    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN IF NOT EXISTS ventas_efectivo DECIMAL(10,2) DEFAULT 0`).catch(() => {});
+    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN IF NOT EXISTS ventas_tarjeta DECIMAL(10,2) DEFAULT 0`).catch(() => {});
+    await connection.query(`ALTER TABLE historial_cortes ADD COLUMN IF NOT EXISTS ventas_transferencia DECIMAL(10,2) DEFAULT 0`).catch(() => {});
     await connection.query(`ALTER TABLE historial_cashback MODIFY COLUMN tipo VARCHAR(50)`).catch(() => {});
     await connection.query(`ALTER TABLE clientes MODIFY COLUMN nivel_vip VARCHAR(50)`).catch(() => {});
+
+    // Crear la restricción de usuario único por empresa (evita colisiones)
+    await connection.query(`ALTER TABLE staff DROP INDEX IF EXISTS usuario`).catch(() => {});
+    await connection.query(`ALTER TABLE staff ADD UNIQUE INDEX idx_usuario_empresa (empresa_id, usuario)`).catch(() => {});
+
+    // Insertar cuenta maestra si no existe
+    const [empresaMaestra] = await connection.query(`SELECT id FROM empresas WHERE id = 1`);
+    if(empresaMaestra.length === 0){
+        await connection.query(`INSERT INTO empresas (id, codigo_empresa, nombre_comercial, plan, estado) VALUES (1, 'ADMIN', 'Administración Central SaaS', 'infinity', 'activo')`);
+        await connection.query(`INSERT INTO sucursales (id, empresa_id, nombre, direccion) VALUES (1, 1, 'Control de Mando', 'Sede Central')`);
+        await connection.query(`INSERT INTO staff (id, empresa_id, sucursal_id, nombre, usuario, password, rol) VALUES (1, 1, 1, 'Paulino Pérez Sánchez', 'paulino', 'admin123', 'admin_oficina')`);
+    }
 
     connection.release();
 }).catch(err => console.error('❌ Error Crítico BD:', err));
@@ -89,13 +97,9 @@ pool.getConnection().then(async (connection) => {
 // 🛡️ MIDDLEWARE DE SEGURIDAD SAAS
 // ==============================================================================
 const validarAccesoSaaS = async (req, res, next) => {
-    // 🚨 Las rutas de los webhooks son públicas porque las llama el proveedor
-    const rutasPublicas = ['/api/web/catalogo', '/api/web/crear-pedido', '/api/oficina/login', '/api/pos/login', '/api/bodega/login', '/api/web/storefront'];
-    
-    // Si la ruta inicia con el webhook, déjala pasar
-    if (req.path.startsWith('/api/pos/terminal/webhook/') || rutasPublicas.includes(req.path)) {
-        return next();
-    }
+    // 🚨 Se agregó '/api/publico/registro-cliente' a las rutas públicas
+    const rutasPublicas = ['/api/publico/registro-cliente', '/api/web/catalogo', '/api/web/crear-pedido', '/api/oficina/login', '/api/pos/login', '/api/bodega/login', '/api/web/storefront'];
+    if (req.path.startsWith('/api/pos/terminal/webhook/') || rutasPublicas.includes(req.path)) return next();
 
     const authHeader = req.headers['authorization'];
     if (!authHeader) return res.status(401).json({ exito: false, error: 'Acceso denegado. Token faltante.' });
@@ -112,44 +116,168 @@ const validarAccesoSaaS = async (req, res, next) => {
 app.use('/api', validarAccesoSaaS);
 
 // ==============================================================================
-// 💌 MOTOR DE CORREOS VIP (Sigue siendo Global)
+// 👑 1. MÓDULO SUPER ADMIN (PAULINO CREA LA LICENCIA)
 // ==============================================================================
-async function enviarCorreoVIP(email, nombre, qrHash, nivel, bono = 0) {
+const validarSuperAdmin = (req, res, next) => {
+    if (req.usuario.empresa_id !== 1 || req.usuario.rol !== 'admin_oficina') {
+        return res.status(403).json({ exito: false, error: 'Área exclusiva del Super Administrador.' });
+    }
+    next();
+};
+
+app.post('/api/superadmin/generar-licencia', validarSuperAdmin, async (req, res) => {
+    try {
+        const { nombre_comercial, plan, limite_sucursales } = req.body;
+        
+        const generarClave = () => 'SAAS-' + Math.random().toString(36).substring(2, 6).toUpperCase() + '-' + Math.random().toString(36).substring(2, 6).toUpperCase();
+        const codigoLicencia = generarClave();
+
+        await pool.query(
+            "INSERT INTO empresas (nombre_comercial, plan, estado, codigo_licencia, limite_sucursales) VALUES (?, ?, 'pendiente_registro', ?, ?)", 
+            [nombre_comercial, plan, codigoLicencia, limite_sucursales || 1]
+        );
+
+        res.json({ exito: true, mensaje: "Licencia generada. Entrégasela al cliente.", codigo_licencia: codigoLicencia });
+    } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
+});
+
+// Ruta para suspender/activar a un cliente
+app.put('/api/superadmin/empresas/:id/estado', validarSuperAdmin, async (req, res) => {
+    try {
+        const { nuevo_estado } = req.body; // 'activo' o 'suspendido'
+        await pool.query("UPDATE empresas SET estado = ? WHERE id = ?", [nuevo_estado, req.params.id]);
+        res.json({ exito: true, mensaje: `La empresa ahora está ${nuevo_estado}` });
+    } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
+});
+
+// ==============================================================================
+// 🚀 2. MÓDULO CLIENTE (EL CLIENTE SE AUTO-REGISTRA)
+// ==============================================================================
+app.post('/api/publico/registro-cliente', async (req, res) => {
+    const connection = await pool.getConnection();
+    await connection.beginTransaction();
+    try {
+        const { codigo_licencia, codigo_empresa, admin_nombre, admin_usuario, admin_password } = req.body;
+
+        const [empresa] = await connection.query("SELECT id, estado FROM empresas WHERE codigo_licencia = ?", [codigo_licencia]);
+        if (empresa.length === 0) throw new Error("Licencia inválida.");
+        if (empresa[0].estado !== 'pendiente_registro') throw new Error("Licencia ya utilizada.");
+
+        const [checkCodigo] = await connection.query("SELECT id FROM empresas WHERE codigo_empresa = ?", [codigo_empresa]);
+        if (checkCodigo.length > 0) throw new Error("Ese código de empresa ya está en uso. Por favor, elige otro.");
+
+        const empresaId = empresa[0].id;
+
+        await connection.query(
+            "INSERT INTO staff (empresa_id, nombre, usuario, password, rol) VALUES (?, ?, ?, ?, 'admin_oficina')", 
+            [empresaId, admin_nombre, admin_usuario, admin_password]
+        );
+
+        const configs = [['bono_bienvenida', '150'], ['cashback_plata_efectivo', '5'], ['cashback_plata_tarjeta', '2'], ['cashback_oro_efectivo', '10'], ['cashback_oro_tarjeta', '5'], ['cashback_titanio_efectivo', '15'], ['cashback_titanio_tarjeta', '8']];
+        for (let conf of configs) { await connection.query("INSERT INTO configuracion_tienda (parametro, empresa_id, valor) VALUES (?, ?, ?)", [conf[0], empresaId, conf[1]]); }
+        
+        await connection.query("UPDATE empresas SET estado = 'activo', codigo_licencia = NULL, codigo_empresa = ? WHERE id = ?", [codigo_empresa, empresaId]);
+
+        await connection.commit();
+        res.json({ exito: true, mensaje: "Empresa registrada con éxito." });
+    } catch(e) {
+        await connection.rollback(); res.status(400).json({ exito: false, error: e.message });
+    } finally { connection.release(); }
+});
+
+// ==============================================================================
+// 🔑 3. AUTENTICACIÓN SAAS (REQUIERE CÓDIGO DE EMPRESA)
+// ==============================================================================
+app.post('/api/oficina/login', async (req, res) => { 
+    try {
+        const { codigo_empresa, usuario, password } = req.body;
+        const query = `
+            SELECT s.id, s.empresa_id, s.sucursal_id, s.rol, s.nombre 
+            FROM staff s 
+            JOIN empresas e ON s.empresa_id = e.id 
+            WHERE e.codigo_empresa = ? AND s.usuario = ? AND s.password = ? AND s.rol = "admin_oficina" AND e.estado = 'activo'
+        `;
+        const [rows] = await pool.query(query, [codigo_empresa, usuario, password]);
+        
+        if (rows.length) {
+            const token = jwt.sign({ id_staff: rows[0].id, empresa_id: rows[0].empresa_id, sucursal_id: rows[0].sucursal_id, rol: rows[0].rol }, SECRET_KEY, { expiresIn: '7d' });
+            res.json({ exito: true, nombre: rows[0].nombre, token }); 
+        } else {
+            res.status(401).json({ exito: false, error: 'Credenciales inválidas o empresa suspendida.' });
+        }
+    } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
+});
+
+app.post('/api/pos/login', async (req, res) => { 
+    try {
+        const { codigo_empresa, usuario, password } = req.body;
+        const query = `
+            SELECT s.id, s.empresa_id, s.sucursal_id, s.rol, s.nombre 
+            FROM staff s 
+            JOIN empresas e ON s.empresa_id = e.id 
+            WHERE e.codigo_empresa = ? AND s.usuario = ? AND s.password = ? AND s.rol = "vendedor_pos" AND e.estado = 'activo'
+        `;
+        const [rows] = await pool.query(query, [codigo_empresa, usuario, password]);
+        
+        if (rows.length) {
+            const token = jwt.sign({ id_staff: rows[0].id, empresa_id: rows[0].empresa_id, sucursal_id: rows[0].sucursal_id, rol: rows[0].rol }, SECRET_KEY, { expiresIn: '365d' });
+            res.json({ exito: true, nombre: rows[0].nombre, token }); 
+        } else {
+            res.status(401).json({ exito: false, error: 'Credenciales inválidas o empresa suspendida.' });
+        }
+    } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
+});
+
+app.post('/api/bodega/login', async (req, res) => { 
+    try {
+        const { codigo_empresa, usuario, password } = req.body;
+        const query = `
+            SELECT s.id, s.empresa_id, s.sucursal_id, s.rol, s.nombre 
+            FROM staff s 
+            JOIN empresas e ON s.empresa_id = e.id 
+            WHERE e.codigo_empresa = ? AND s.usuario = ? AND s.password = ? AND s.rol = "operador_bodega" AND e.estado = 'activo'
+        `;
+        const [rows] = await pool.query(query, [codigo_empresa, usuario, password]);
+        
+        if (rows.length) {
+            const token = jwt.sign({ id_staff: rows[0].id, empresa_id: rows[0].empresa_id, sucursal_id: rows[0].sucursal_id, rol: rows[0].rol }, SECRET_KEY, { expiresIn: '30d' });
+            res.json({ exito: true, nombre: rows[0].nombre, token }); 
+        } else {
+            res.status(401).json({ exito: false, error: 'Credenciales inválidas o empresa suspendida.' });
+        }
+    } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
+});
+
+
+// ==============================================================================
+// 💌 MOTOR DE CORREOS VIP (100% MARCA BLANCA)
+// ==============================================================================
+async function enviarCorreoVIP(empresa_id, email, nombre, qrHash, nivel, bono = 0) {
     if (!email) return;
     try {
+        const connection = await pool.getConnection();
+        const [empresa] = await connection.query('SELECT nombre_comercial, llaves_api FROM empresas WHERE id = ?', [empresa_id]);
+        connection.release();
+
+        const nombreEmpresa = empresa[0].nombre_comercial || 'Nuestra Tienda';
+        const llaves = empresa[0].llaves_api || {};
+        const remitente = llaves.correo_remitente || 'SaaS VIP <vip@ppservice.icu>';
+
         const qrImageUrl = `https://quickchart.io/qr?text=${encodeURIComponent(qrHash)}&size=400&margin=1&dark=000000&light=ffffff`;
         const hoy = new Date(); const emitido = `${hoy.getDate().toString().padStart(2,'0')}/${(hoy.getMonth()+1).toString().padStart(2,'0')}/${hoy.getFullYear()}`;
         hoy.setFullYear(hoy.getFullYear() + 1); const vence = `${hoy.getDate().toString().padStart(2,'0')}/${(hoy.getMonth()+1).toString().padStart(2,'0')}/${hoy.getFullYear()}`;
         
-        let bgGradient = 'linear-gradient(135deg, #e0e0e0 0%, #ffffff 40%, #b0b0b0 100%)'; let bgColor = '#e0e0e0'; let textColor = '#010101'; let logoFile = 'logo_negro.png';
+        let bgGradient = 'linear-gradient(135deg, #e0e0e0 0%, #ffffff 40%, #b0b0b0 100%)'; let bgColor = '#e0e0e0'; let textColor = '#010101'; 
         if (nivel === 'oro') { bgGradient = 'linear-gradient(135deg, #bf953f 0%, #fcf6ba 40%, #b38728 100%)'; bgColor = '#d4af37'; } 
-        else if (nivel === 'titanio') { bgGradient = 'linear-gradient(135deg, #333333 0%, #555555 50%, #1a1a1a 100%)'; bgColor = '#222222'; textColor = '#fffffe'; logoFile = 'logo_blanco.png'; }
+        else if (nivel === 'titanio') { bgGradient = 'linear-gradient(135deg, #333333 0%, #555555 50%, #1a1a1a 100%)'; bgColor = '#222222'; textColor = '#fffffe'; }
         
-        let logoUrl = `${DOMINIO_SAAS}/uploads/${logoFile}`;
         let msjBono = bono > 0 ? `<div style="font-size: 15px; margin-bottom: 25px; color: #2ecc71; font-weight: bold;">+ $${bono} MXN APLICADOS</div>` : '';
         
-        const htmlContent = `<!DOCTYPE html><html lang="es"><body><div style="text-align: center;"><img src="${logoUrl}" width="120"/><br><h2>${nombre}</h2><img src="${qrImageUrl}" width="150" /><p>ID: ${qrHash}</p>${msjBono}</div></body></html>`;
-        await resend.emails.send({ from: 'SaaS VIP <ventas@jpjeansvip.com>', to: email, subject: `Tu Tarjeta VIP - Nivel ${nivel.toUpperCase()}`, html: htmlContent });
+        const htmlContent = `<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Tarjeta VIP ${nombreEmpresa}</title></head><body style="background-color: #121212; margin: 0; padding: 0; font-family: sans-serif; text-align: center;"><div style="padding: 40px 20px; width: 100%; box-sizing: border-box; background-color: #121212;"><h2 style="color: #ffffff; font-weight: 300; letter-spacing: 2px; font-size: 20px; margin-top: 0;">BIENVENIDO AL CLUB VIP DE ${nombreEmpresa.toUpperCase()}</h2><p style="color: #aaaaaa; margin-bottom: 20px; font-size: 14px;">Presenta tu tarjeta digital en sucursal.</p>${msjBono}<table align="center" width="360" cellpadding="0" cellspacing="0" border="0" bgcolor="${bgColor}" style="background-image: ${bgGradient}; border-radius: 20px; border: 1px solid #444; margin: 0 auto;"><tr><td align="center" style="padding: 40px 25px;"><div style="font-size: 26px; font-weight: 900; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px;"><span style="color: ${textColor} !important;">${nombre}</span></div><table align="center" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="background-color: #ffffff; padding: 8px; border-radius: 14px; margin-bottom: 30px;"><tr><td><img src="${qrImageUrl}" width="150" height="150" style="display: block; border-radius: 8px; border: 0;" alt="QR VIP" /></td></tr></table><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="left" style="font-size: 10px; font-weight: bold; opacity: 0.8; letter-spacing: 1px;"><span style="color: ${textColor} !important;">EMITIDA</span><br><span style="font-size: 12px; font-weight: 900; color: ${textColor} !important;">${emitido}</span></td><td align="right" style="font-size: 10px; font-weight: bold; opacity: 0.8; letter-spacing: 1px; text-align: right;"><span style="color: ${textColor} !important;">VENCE</span><br><span style="font-size: 12px; font-weight: 900; color: ${textColor} !important;">${vence}</span></td></tr></table></td></tr></table><p style="margin-top: 30px; font-size: 13px; color: #666666; letter-spacing: 1.5px;">ID EXCLUSIVO: ${qrHash}</p></div></body></html>`;
+        
+        await resend.emails.send({ from: remitente, to: email, subject: `Tu Tarjeta VIP de ${nombreEmpresa} - Nivel ${nivel.toUpperCase()}`, html: htmlContent });
     } catch (err) { console.error("Error correo VIP:", err); }
 }
-
-// ==============================================================================
-// 🔑 AUTENTICACIÓN SAAS
-// ==============================================================================
-app.post('/api/oficina/login', async (req, res) => { 
-    const [rows] = await pool.query('SELECT id, empresa_id, sucursal_id, rol, nombre FROM staff WHERE usuario=? AND password=? AND rol="admin_oficina"', [req.body.usuario, req.body.password]);
-    if (rows.length) res.json({ exito: true, nombre: rows[0].nombre, token: jwt.sign({ id_staff: rows[0].id, empresa_id: rows[0].empresa_id, sucursal_id: rows[0].sucursal_id, rol: rows[0].rol }, SECRET_KEY, { expiresIn: '7d' }) }); else res.status(401).json({ exito: false });
-});
-
-app.post('/api/pos/login', async (req, res) => { 
-    const [rows] = await pool.query('SELECT id, empresa_id, sucursal_id, rol, nombre FROM staff WHERE usuario=? AND password=? AND rol="vendedor_pos"', [req.body.usuario, req.body.password]);
-    if (rows.length) res.json({ exito: true, nombre: rows[0].nombre, token: jwt.sign({ id_staff: rows[0].id, empresa_id: rows[0].empresa_id, sucursal_id: rows[0].sucursal_id, rol: rows[0].rol }, SECRET_KEY, { expiresIn: '365d' }) }); else res.status(401).json({ exito: false });
-});
-
-app.post('/api/bodega/login', async (req, res) => { 
-    const [rows] = await pool.query('SELECT id, empresa_id, sucursal_id, rol, nombre FROM staff WHERE usuario=? AND password=? AND rol="operador_bodega"', [req.body.usuario, req.body.password]);
-    if (rows.length) res.json({ exito: true, nombre: rows[0].nombre, token: jwt.sign({ id_staff: rows[0].id, empresa_id: rows[0].empresa_id, sucursal_id: rows[0].sucursal_id, rol: rows[0].rol }, SECRET_KEY, { expiresIn: '30d' }) }); else res.status(401).json({ exito: false });
-});
 
 // ==============================================================================
 // ⚙️ LLAVES API DINÁMICAS
@@ -264,7 +392,7 @@ app.post('/api/pos/vip/registrar', async (req, res) => {
         let bono = conf.length > 0 ? parseFloat(conf[0].valor) : 150; 
         const [result] = await connection.query(`INSERT INTO clientes (empresa_id, nombre, email, telefono, saldo_cashback, compras_totales, nivel_vip, qr_hash) VALUES (?, ?, ?, ?, ?, 0, 'plata', ?)`, [req.usuario.empresa_id, nombre, email, telefono, bono, qr_hash]);
         await connection.query(`INSERT INTO historial_cashback (empresa_id, id_cliente, monto, tipo, descripcion) VALUES (?, ?, ?, 'bono_bienvenida', 'Bono Inicial - Nivel Plata')`, [req.usuario.empresa_id, result.insertId, bono]);
-        await connection.commit(); enviarCorreoVIP(email, nombre, qr_hash, 'plata', bono); res.json({ exito: true, qr_hash: qr_hash, saldo: bono, nivel: 'plata' });
+        await connection.commit(); enviarCorreoVIP(req.usuario.empresa_id, email, nombre, qr_hash, 'plata', bono); res.json({ exito: true, qr_hash: qr_hash, saldo: bono, nivel: 'plata' });
     } catch (e) { await connection.rollback(); res.status(500).json({ exito: false, error: e.message }); } finally { connection.release(); }
 });
 
@@ -275,17 +403,14 @@ app.post('/api/pos/vip/traspasar', async (req, res) => {
         if (cliente.length === 0) throw new Error("La tarjeta vieja no existe.");
         await connection.query('UPDATE clientes SET qr_hash = ?, nivel_vip = ? WHERE id = ?', [nuevo_qr, nuevo_nivel, cliente[0].id]);
         await connection.query('INSERT INTO historial_cashback (empresa_id, id_cliente, monto, tipo, descripcion) VALUES (?, ?, ?, "traspaso", ?)', [req.usuario.empresa_id, cliente[0].id, 0, `Traspaso a ${nuevo_nivel}`]);
-        await connection.commit(); enviarCorreoVIP(cliente[0].email, cliente[0].nombre, nuevo_qr, nuevo_nivel, 0); res.json({ exito: true });
+        await connection.commit(); enviarCorreoVIP(req.usuario.empresa_id, cliente[0].email, cliente[0].nombre, nuevo_qr, nuevo_nivel, 0); res.json({ exito: true });
     } catch (e) { await connection.rollback(); res.status(400).json({ exito: false, error: e.message }); } finally { connection.release(); }
 });
 
 app.post('/api/pos/vender', async (req, res) => {
     let { carrito, metodo_pago, codigo_creador, mp_intent_id, qr_vip, monto_cashback_usado } = req.body; 
     const { empresa_id, sucursal_id } = req.usuario;
-
     if (metodo_pago === 'Tarjeta MP') metodo_pago = 'Tarjeta';
-    
-    // (Verificamos que haya mp_intent_id si es Tarjeta MP u otro proveedor, la validación se hace en el enrutador multi-terminal)
 
     const connection = await pool.getConnection(); await connection.beginTransaction(); 
     try { 
@@ -382,120 +507,69 @@ app.post('/api/pos/corte-caja', async (req, res) => {
 // ==============================================================================
 // 💳 ENRUTADOR MULTI-TERMINAL SAAS (Mercado Pago, Clip, Santander, Zettle)
 // ==============================================================================
-
-// 1. Enviar el cobro a la terminal seleccionada
 app.post('/api/pos/terminal/cobrar', async (req, res) => {
     try {
-        const { total, proveedor } = req.body; // proveedor puede ser: 'mercadopago', 'clip', 'santander'
+        const { total, proveedor } = req.body; 
         const { empresa_id } = req.usuario;
-
         const [empresa] = await pool.query('SELECT llaves_api FROM empresas WHERE id = ?', [empresa_id]);
         const llaves = empresa[0].llaves_api || {};
-        
         const referencia_interna = `POS-${empresa_id}-${Date.now()}`;
         const montoEnCentavos = Math.round(total * 100);
 
         if (proveedor === 'mercadopago') {
-            const deviceId = llaves.mp_device_id;
-            const token = llaves.mp_access_token;
-            if (!deviceId || !token) return res.status(400).json({ exito: false, error: 'Llaves Mercado Pago no configuradas.' });
-
+            const deviceId = llaves.mp_device_id; const token = llaves.mp_access_token;
+            if (!deviceId || !token) return res.status(400).json({ exito: false, error: 'Llaves MP no configuradas.' });
             const urlMP = `https://api.mercadopago.com/point/integration-api/devices/${deviceId}/payment-intents`;
-            const response = await fetch(urlMP, { 
-                method: 'POST', 
-                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, 
-                body: JSON.stringify({ amount: montoEnCentavos, additional_info: { external_reference: referencia_interna, print_on_terminal: true } }) 
-            });
+            const response = await fetch(urlMP, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: montoEnCentavos, additional_info: { external_reference: referencia_interna, print_on_terminal: true } }) });
             const data = await response.json(); 
             if (response.ok && data.id) return res.json({ exito: true, intent_id: data.id, proveedor: 'mercadopago' });
             else throw new Error('Terminal MP no responde.');
-
         } else if (proveedor === 'clip') {
-            const token = llaves.clip_api_key;
-            if (!token) return res.status(400).json({ exito: false, error: 'Llaves Clip no configuradas.' });
-            
-            // Ejemplo de llamada a la API de Clip (Push to Device)
+            const token = llaves.clip_api_key; if (!token) return res.status(400).json({ exito: false, error: 'Llaves Clip no configuradas.' });
             const urlClip = `https://api.payclip.com/payment/request`;
-            const response = await fetch(urlClip, {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ amount: total, reference: referencia_interna, message: "Cobro SaaS" })
-            });
-            const data = await response.json();
-            return res.json({ exito: true, intent_id: data.payment_request_id || referencia_interna, proveedor: 'clip' });
-
+            const response = await fetch(urlClip, { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: total, reference: referencia_interna, message: "Cobro SaaS" }) });
+            const data = await response.json(); return res.json({ exito: true, intent_id: data.payment_request_id || referencia_interna, proveedor: 'clip' });
         } else if (proveedor === 'santander') {
-            // Aquí se integra la lógica de API de Getnet / Santander
-            const terminalId = llaves.santander_terminal_id;
-            if (!terminalId) return res.status(400).json({ exito: false, error: 'Terminal Santander no configurada.' });
+            const terminalId = llaves.santander_terminal_id; if (!terminalId) return res.status(400).json({ exito: false, error: 'Terminal Santander no configurada.' });
             return res.json({ exito: true, intent_id: referencia_interna, proveedor: 'santander' });
-        } 
-        
-        else {
-            return res.status(400).json({ exito: false, error: 'Proveedor de terminal no soportado.' });
-        }
+        } else { return res.status(400).json({ exito: false, error: 'Proveedor de terminal no soportado.' }); }
     } catch (e) { res.status(500).json({ exito: false, error: e.message }); }
 });
 
-// 2. Verificar el estado del cobro (Polling)
 app.get('/api/pos/terminal/estado/:proveedor/:intent_id', async (req, res) => {
     try {
-        const { proveedor, intent_id } = req.params;
-        const [empresa] = await pool.query('SELECT llaves_api FROM empresas WHERE id = ?', [req.usuario.empresa_id]);
-        const llaves = empresa[0].llaves_api || {};
-
+        const { proveedor, intent_id } = req.params; const [empresa] = await pool.query('SELECT llaves_api FROM empresas WHERE id = ?', [req.usuario.empresa_id]); const llaves = empresa[0].llaves_api || {};
         if (proveedor === 'mercadopago') {
-            const token = llaves.mp_access_token;
-            const response = await fetch(`https://api.mercadopago.com/point/integration-api/payment-intents/${intent_id}`, { headers: { 'Authorization': `Bearer ${token}` } });
+            const token = llaves.mp_access_token; const response = await fetch(`https://api.mercadopago.com/point/integration-api/payment-intents/${intent_id}`, { headers: { 'Authorization': `Bearer ${token}` } });
             const data = await response.json(); 
             if (response.ok && data.state) { 
                 let estadoPago = 'desconocido'; 
-                if (data.state === 'FINISHED' && data.payment && data.payment.id) { 
-                    const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${data.payment.id}`, { headers: { 'Authorization': `Bearer ${token}` } }); 
-                    const payData = await payRes.json(); estadoPago = payData.status || 'desconocido'; 
-                } else if (data.state === 'CANCELED' || data.state === 'ERROR') estadoPago = 'rejected'; 
+                if (data.state === 'FINISHED' && data.payment && data.payment.id) { const payRes = await fetch(`https://api.mercadopago.com/v1/payments/${data.payment.id}`, { headers: { 'Authorization': `Bearer ${token}` } }); const payData = await payRes.json(); estadoPago = payData.status || 'desconocido'; } 
+                else if (data.state === 'CANCELED' || data.state === 'ERROR') estadoPago = 'rejected'; 
                 return res.json({ exito: true, estado: data.state, estado_pago: estadoPago }); 
             }
-        } else if (proveedor === 'clip') {
-            // Lógica de verificación de estado en Clip API
-            return res.json({ exito: true, estado: 'FINISHED', estado_pago: 'approved' }); // Simulación
-        }
-
+        } else if (proveedor === 'clip') { return res.json({ exito: true, estado: 'FINISHED', estado_pago: 'approved' }); }
         res.status(400).json({ exito: false, error: 'Verificación no disponible.' });
     } catch (e) { res.status(500).json({ exito: false, error: 'Fallo al consultar a la terminal.' }); }
 });
 
-// 3. Webhook Dinámico que recibe confirmaciones de cualquier empresa
 app.post('/api/pos/terminal/webhook/:proveedor', async (req, res) => {
     try {
-        const { proveedor } = req.params;
-        const evento = req.body; 
-        res.status(200).send("OK"); // Responder siempre rápido al webhook
-
+        const { proveedor } = req.params; const evento = req.body; res.status(200).send("OK");
         const connection = await pool.getConnection();
-
         if (proveedor === 'mercadopago' && (evento.action === "payment.created" || evento.type === "payment")) {
             const pagoId = evento.data.id; 
             const [pedidos] = await connection.query("SELECT * FROM pedidos_web WHERE id_transaccion = ? OR id_transaccion = ?", [`MP-${pagoId}`, pagoId.toString()]);
             if (pedidos.length > 0) {
-                const empresa_id = pedidos[0].empresa_id;
-                const [emp] = await connection.query('SELECT llaves_api FROM empresas WHERE id = ?', [empresa_id]);
-                const token = (emp[0].llaves_api || {}).mp_access_token;
+                const empresa_id = pedidos[0].empresa_id; const [emp] = await connection.query('SELECT llaves_api FROM empresas WHERE id = ?', [empresa_id]); const token = (emp[0].llaves_api || {}).mp_access_token;
                 if(token){
-                    const response = await fetch(`https://api.mercadopago.com/v1/payments/${pagoId}`, { headers: { 'Authorization': `Bearer ${token}` } });
-                    const datosPago = await response.json();
-                    if (datosPago.status === "approved") {
-                        await connection.query("UPDATE pedidos_web SET estado = 'preparando_envio' WHERE id = ?", [pedidos[0].id]);
-                        await connection.query('INSERT INTO bitacora_movimientos (empresa_id, tipo, descripcion, monto, cantidad, metodo_pago) VALUES (?, "VENTA_WEB", ?, ?, 0, "Efectivo OXXO")', [empresa_id, `[PEDIDO WEB #${pedidos[0].id}] Pago Web Aprobado.`, datosPago.transaction_amount]);
-                    }
+                    const response = await fetch(`https://api.mercadopago.com/v1/payments/${pagoId}`, { headers: { 'Authorization': `Bearer ${token}` } }); const datosPago = await response.json();
+                    if (datosPago.status === "approved") { await connection.query("UPDATE pedidos_web SET estado = 'preparando_envio' WHERE id = ?", [pedidos[0].id]); await connection.query('INSERT INTO bitacora_movimientos (empresa_id, tipo, descripcion, monto, cantidad, metodo_pago) VALUES (?, "VENTA_WEB", ?, ?, 0, "Efectivo OXXO")', [empresa_id, `[PEDIDO WEB #${pedidos[0].id}] Pago Web Aprobado.`, datosPago.transaction_amount]); }
                 }
             }
-        } else if (proveedor === 'clip' || proveedor === 'santander') {
-            // Aquí se recibe la notificación de Clip o Santander Webhooks
-        }
-        
+        } 
         connection.release();
-    } catch (e) { console.error(`Error Webhook ${req.params.proveedor}:`, e); }
+    } catch (e) { console.error(`Error Webhook:`, e); }
 });
 
 // ==============================================================================
@@ -565,6 +639,29 @@ app.post('/api/pos/apartados/cancelar/:id', async (req, res) => {
 // ==============================================================================
 // 4. APLICACIÓN OFICINA (RADAR, VENDEDORES, IA, ETC.)
 // ==============================================================================
+
+// 🏢 CREACIÓN DE SUCURSALES (LIMITADA POR PLAN)
+app.post('/api/oficina/sucursales/nueva', async (req, res) => {
+    const connection = await pool.getConnection(); await connection.beginTransaction();
+    try {
+        const { nombre_sucursal, direccion, pos_usuario, pos_password } = req.body;
+        const empresaId = req.usuario.empresa_id;
+
+        const [emp] = await connection.query("SELECT limite_sucursales FROM empresas WHERE id = ?", [empresaId]);
+        const limite = emp[0].limite_sucursales;
+        const [sucursalesActuales] = await connection.query("SELECT COUNT(*) as total FROM sucursales WHERE empresa_id = ?", [empresaId]);
+        
+        if (sucursalesActuales[0].total >= limite) throw new Error(`Tu plan actual solo permite ${limite} sucursal(es). Contacta a soporte para mejorar tu plan.`);
+
+        const [resSucursal] = await connection.query("INSERT INTO sucursales (empresa_id, nombre, direccion) VALUES (?, ?, ?)", [empresaId, nombre_sucursal, direccion]);
+        const sucursalId = resSucursal.insertId;
+
+        await connection.query("INSERT INTO staff (empresa_id, sucursal_id, nombre, usuario, password, rol) VALUES (?, ?, ?, ?, ?, 'vendedor_pos')", [empresaId, sucursalId, `Caja - ${nombre_sucursal}`, pos_usuario, pos_password]);
+
+        await connection.commit(); res.json({ exito: true, mensaje: "Sucursal y acceso de caja creados correctamente." });
+    } catch (e) { await connection.rollback(); res.status(400).json({ exito: false, error: e.message }); } finally { connection.release(); }
+});
+
 app.get('/api/oficina/configuracion', async (req, res) => {
     try { const [rows] = await pool.query('SELECT parametro, valor FROM configuracion_tienda WHERE empresa_id = ?', [req.usuario.empresa_id]); let config = {}; rows.forEach(r => config[r.parametro] = r.valor); res.json({ exito: true, config }); } catch (e) { res.status(500).json({ exito: false }); }
 });
